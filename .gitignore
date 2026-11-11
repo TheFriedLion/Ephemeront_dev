@@ -1,0 +1,8 @@
+build/
+*.obj
+*.pdb
+*.ilk
+docs/
+pivot/
+tools/*.wav
+__pycache__/
