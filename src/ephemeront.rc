@@ -1,0 +1,2 @@
+// Resources compiled into Ephemeront.exe. The icon comes from tools/make_icon.py.
+1 ICON "ephemeront.ico"

@@ -150,7 +150,7 @@ void Build(HWND hwnd, HINSTANCE instance) {
     hotkey(L"Quick Save hotkey", ID_QUICK_HOTKEY, s.quickSave);
     hotkey(L"Clip Picker hotkey", ID_PICKER_HOTKEY, s.picker);
     number(L"Quick Save length", ID_QUICK_SECONDS, s.quickSaveSeconds, L"seconds");
-    number(L"Buffer length", ID_BUFFER_SECONDS, s.bufferSeconds, L"seconds (longest clip)");
+    number(L"Buffer length", ID_BUFFER_SECONDS, s.bufferSeconds, L"seconds of sound");
 
     label(L"Sample rate");
     HWND rate = add(WC_COMBOBOXW, L"", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, fieldX, y, fieldW, S(120),
@@ -185,10 +185,11 @@ void Build(HWND hwnd, HINSTANCE instance) {
 
     y += S(6);
     add(L"STATIC",
-        L"Memory: about 23 MB per minute of buffer, per track, only while that track is making sound. "
-        L"Changing the buffer length or sample rate clears what's recorded so far.",
-        0, labelX, y, S(418), S(54), -1);
-    y += S(66);
+        L"Silences longer than 4 seconds aren't recorded, so the buffer fills with sound only. "
+        L"Memory: about 23 MB per minute of buffer, per track that made sound. "
+        L"Changing the sample rate clears what's recorded so far.",
+        0, labelX, y, S(418), S(70), -1);
+    y += S(82);
 
     add(L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, S(250), y, S(88), S(28), IDOK);
     add(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, S(346), y, S(88), S(28), IDCANCEL);
@@ -257,7 +258,7 @@ void SettingsUiOpen(HINSTANCE instance) {
 
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi);
-    RECT rc = {0, 0, S(450), S(518)};
+    RECT rc = {0, 0, S(450), S(534)};
     AdjustWindowRectExForDpi(&rc, style, FALSE, 0, g_dpi);
     int w = rc.right - rc.left, h = rc.bottom - rc.top;
     const RECT& work = mi.rcWork;

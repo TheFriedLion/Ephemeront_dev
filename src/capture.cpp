@@ -185,6 +185,125 @@ std::wstring DefaultDeviceId(EDataFlow flow) {
     return id;
 }
 
+// ---- Activity: which stretches of time are worth keeping ----------------------
+
+int64_t KeepAfter() { return static_cast<int64_t>(SampleRate()) * Capture::kKeepAfterSoundMs / 1000; }
+int64_t KeepBefore() { return static_cast<int64_t>(SampleRate()) * Capture::kKeepBeforeSoundMs / 1000; }
+
+// Every source reports when it makes sound. Sounds closer together than the
+// silence allowance join into one segment; the silence between segments is cut.
+// Each segment keeps a little quiet before its first sound and the allowance
+// after its last, and only the newest `buffer_` frames of segments are kept.
+class Activity {
+public:
+    void Reset(int64_t bufferFrames) {
+        std::lock_guard<std::mutex> lock(m_);
+        segs_.clear();
+        buffer_ = bufferFrames;
+        floor_ = 0;
+    }
+
+    void SetBuffer(int64_t bufferFrames) {
+        std::lock_guard<std::mutex> lock(m_);
+        buffer_ = bufferFrames;
+    }
+
+    // Something made sound over clock frames [a, b).
+    void MarkSound(int64_t a, int64_t b) {
+        std::lock_guard<std::mutex> lock(m_);
+        const int64_t start = std::max(a - KeepBefore(), floor_);
+        if (b <= start) return;
+        if (!segs_.empty()) {
+            Seg& last = segs_.back();
+            if (start >= last.start && start <= KeptEnd(last)) {  // the usual case
+                last.soundEnd = std::max(last.soundEnd, b);
+                return;
+            }
+        }
+        // Sources report a few milliseconds apart, so occasionally a sound lands
+        // before or between existing segments. Merge it with whatever it touches.
+        size_t i = 0;
+        while (i < segs_.size() && KeptEnd(segs_[i]) < start) ++i;
+        size_t j = i;
+        while (j < segs_.size() && segs_[j].start <= b + KeepAfter()) ++j;
+        Seg merged{start, b, 0};
+        if (i < j) {
+            merged.start = std::min(start, segs_[i].start);
+            merged.soundEnd = std::max(b, segs_[j - 1].soundEnd);
+            merged.tape = segs_[i].tape;
+        } else if (i > 0) {
+            merged.tape = segs_[i - 1].tape + KeptEnd(segs_[i - 1]) - segs_[i - 1].start;
+        } else if (!segs_.empty()) {
+            merged.tape = segs_[0].tape;
+        }
+        segs_.erase(segs_.begin() + i, segs_.begin() + j);
+        segs_.insert(segs_.begin() + i, merged);
+        for (size_t k = i + 1; k < segs_.size(); ++k) {
+            const Seg& prev = segs_[k - 1];
+            segs_[k].tape = prev.tape + KeptEnd(prev) - prev.start;
+        }
+    }
+
+    Capture::Timeline Snapshot(int64_t now) {
+        std::lock_guard<std::mutex> lock(m_);
+        Retain(now);
+        Capture::Timeline tl;
+        for (size_t k = 0; k < segs_.size(); ++k) {
+            const int64_t frames = Length(k, now);
+            if (frames > 0) tl.spans.push_back({segs_[k].start, segs_[k].tape, frames});
+        }
+        if (!segs_.empty()) {
+            tl.live = now < KeptEnd(segs_.back());
+            tl.lastSound = segs_.back().soundEnd;
+        }
+        return tl;
+    }
+
+private:
+    struct Seg {
+        int64_t start;     // clock frame where the kept stretch begins
+        int64_t soundEnd;  // clock frame just after its last sound
+        int64_t tape;      // tape position of `start`
+    };
+
+    static int64_t KeptEnd(const Seg& s) { return s.soundEnd + KeepAfter(); }
+
+    // Kept frames of segment k; the newest one only reaches as far as now.
+    int64_t Length(size_t k, int64_t now) const {
+        int64_t end = KeptEnd(segs_[k]);
+        if (k + 1 == segs_.size()) end = std::min(end, now);
+        return std::max<int64_t>(0, end - segs_[k].start);
+    }
+
+    // Drops the oldest audio beyond the buffer length.
+    void Retain(int64_t now) {
+        int64_t total = 0;
+        for (size_t k = 0; k < segs_.size(); ++k) total += Length(k, now);
+        bool trimmed = false;
+        while (total > buffer_ && !segs_.empty()) {
+            const int64_t excess = total - buffer_;
+            const int64_t len = Length(0, now);
+            if (len <= excess && segs_.size() > 1) {
+                total -= len;
+                segs_.erase(segs_.begin());
+            } else {
+                segs_[0].start += excess;
+                segs_[0].tape += excess;
+                total -= excess;
+            }
+            trimmed = true;
+        }
+        if (trimmed) floor_ = segs_.front().start;  // anything earlier is gone for good
+    }
+
+    std::mutex m_;
+    std::vector<Seg> segs_;
+    int64_t buffer_ = 0;
+    int64_t floor_ = 0;
+};
+
+Activity g_activity;
+
 // ---- Source -----------------------------------------------------------------
 
 enum class Kind { System, Mic, App };
@@ -193,8 +312,8 @@ std::atomic<uint64_t> g_nextSourceId{1};
 
 class Source {
 public:
-    Source(Kind kind, DWORD pid, std::wstring name, int seconds)
-        : id(g_nextSourceId++), kind(kind), pid(pid), name(std::move(name)), ring(seconds),
+    Source(Kind kind, DWORD pid, std::wstring name)
+        : id(g_nextSourceId++), kind(kind), pid(pid), name(std::move(name)),
           stop_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
           wake_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
         thread_ = std::thread([this] { Run(); });
@@ -265,9 +384,12 @@ private:
                 for (UINT32 i = 0; i < frames; ++i) mono_[i * 2] = mono_[i * 2 + 1] = pcm[i * 2 + side];
                 pcm = mono_.data();
             }
-            int64_t jump = ring.Write(at, pcm, frames, lost);
-            if (jump && packets_ > 1 && ++realigns_ <= 20) {
-                Log(L"%s: realigned by %.1f ms", name.c_str(), jump * 1000.0 / SampleRate());
+            const RingBuffer::WriteResult placed = ring.Write(at, pcm, frames, lost);
+            if (pcm && PeakOf(pcm, static_cast<size_t>(frames) * kChannels) > kSilentPeak) {
+                g_activity.MarkSound(placed.at, placed.at + frames);
+            }
+            if (placed.jump && packets_ > 1 && ++realigns_ <= 20) {
+                Log(L"%s: realigned by %.1f ms", name.c_str(), placed.jump * 1000.0 / SampleRate());
             }
             capture->ReleaseBuffer(frames);
         }
@@ -482,7 +604,6 @@ struct ManagerState {
     IMMDeviceEnumerator* enumerator = nullptr;
     std::vector<Watch> watches;
     std::set<DWORD> failedApps;
-    int bufferSeconds = -1;
     std::wstring renderDevice, captureDevice;
 };
 
@@ -551,10 +672,7 @@ void Scan(ManagerState& st) {
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
         current = g_sources;
     }
-    if (cfg.bufferSeconds != st.bufferSeconds) {
-        current.clear();
-        st.bufferSeconds = cfg.bufferSeconds;
-    }
+    const Capture::Timeline timeline = g_activity.Snapshot(NowFrame() - TailFrames());
 
     auto find = [&](Kind kind, DWORD pid) -> std::shared_ptr<Source> {
         for (auto& s : current) {
@@ -569,13 +687,13 @@ void Scan(ManagerState& st) {
 
     if (cfg.system) {
         auto s = find(Kind::System, 0);
-        if (!s) s = std::make_shared<Source>(Kind::System, 0, L"System", cfg.bufferSeconds);
+        if (!s) s = std::make_shared<Source>(Kind::System, 0, L"System");
         else if (render != st.renderDevice) s->Reopen();
         next.push_back(s);
     }
     if (cfg.mic) {
         auto s = find(Kind::Mic, 0);
-        if (!s) s = std::make_shared<Source>(Kind::Mic, 0, L"Microphone", cfg.bufferSeconds);
+        if (!s) s = std::make_shared<Source>(Kind::Mic, 0, L"Microphone");
         else if (capture != st.captureDevice) s->Reopen();
         s->SetMonoInput(cfg.micMono);
         next.push_back(s);
@@ -584,7 +702,7 @@ void Scan(ManagerState& st) {
     st.captureDevice = capture;
 
     if (cfg.apps) {
-        const int64_t horizon = NowFrame() - static_cast<int64_t>(cfg.bufferSeconds) * SampleRate();
+        const int64_t horizon = timeline.Empty() ? INT64_MAX : timeline.spans.front().real;
         std::set<DWORD> live;
         for (auto& s : current) {
             if (s->kind != Kind::App) continue;
@@ -604,9 +722,17 @@ void Scan(ManagerState& st) {
             live.insert(root);
             std::wstring name = FriendlyName(root, procs);
             Log(L"New app source: %s (pid %lu)", name.c_str(), root);
-            next.push_back(std::make_shared<Source>(Kind::App, root, name, cfg.bufferSeconds));
+            next.push_back(std::make_shared<Source>(Kind::App, root, name));
         }
     }
+
+    // Free audio that's no longer part of the recording: what aged out, and quiet
+    // stretches that were cut. The last moments are always kept, since a sound
+    // starting now also keeps a little of what came just before it.
+    std::vector<std::pair<int64_t, int64_t>> keep;
+    for (const Capture::Span& s : timeline.spans) keep.emplace_back(s.real, s.RealEnd());
+    const int64_t settled = NowFrame() - KeepBefore() - SampleRate();
+    for (auto& s : next) s->ring.Prune(keep, settled);
 
     {
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
@@ -640,6 +766,22 @@ void ManagerMain() {
     CoUninitialize();
 }
 
+std::shared_ptr<Source> FindSource(uint64_t id) {
+    std::lock_guard<std::mutex> lock(g_sourcesMutex);
+    for (auto& s : g_sources) {
+        if (s->id == id) return s;
+    }
+    return nullptr;
+}
+
+void ReadTapeFrom(const Source& source, const Capture::Timeline& timeline, int64_t tape, int64_t frames,
+                  std::vector<float>& out) {
+    out.assign(static_cast<size_t>(std::max<int64_t>(frames, 0)) * kChannels, 0.0f);
+    for (const Capture::Piece& p : timeline.Pieces(tape, frames)) {
+        source.ring.Read(p.real, p.frames, out.data() + p.offset * kChannels);
+    }
+}
+
 int KindOrder(Kind k) { return k == Kind::System ? 0 : k == Kind::Mic ? 1 : 2; }
 
 std::vector<std::shared_ptr<Source>> SortedSources() {
@@ -658,6 +800,16 @@ std::vector<std::shared_ptr<Source>> SortedSources() {
 }  // namespace
 
 namespace Capture {
+
+std::vector<Piece> Timeline::Pieces(int64_t tape, int64_t frames) const {
+    std::vector<Piece> out;
+    const int64_t end = tape + frames;
+    for (const Span& s : spans) {
+        const int64_t a = std::max(tape, s.tape), b = std::min(end, s.TapeEnd());
+        if (a < b) out.push_back({s.real + (a - s.tape), a - tape, b - a});
+    }
+    return out;
+}
 
 int DeviceMixRate() {
     IMMDeviceEnumerator* enumerator = nullptr;
@@ -679,6 +831,7 @@ int DeviceMixRate() {
 }
 
 void Start(const Config& config) {
+    g_activity.Reset(static_cast<int64_t>(config.bufferSeconds) * SampleRate());
     Configure(config);
     g_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -698,6 +851,7 @@ void Configure(const Config& config) {
         std::lock_guard<std::mutex> lock(g_configMutex);
         g_config = config;
     }
+    g_activity.SetBuffer(static_cast<int64_t>(config.bufferSeconds) * SampleRate());
     if (g_wake) SetEvent(g_wake);
 }
 
@@ -707,29 +861,33 @@ std::vector<SourceInfo> Sources() {
     return out;
 }
 
+Timeline GetTimeline() { return g_activity.Snapshot(NowFrame() - TailFrames()); }
+
 bool Read(uint64_t id, int64_t start, int64_t frames, std::vector<float>& out) {
-    std::shared_ptr<Source> source;
-    {
-        std::lock_guard<std::mutex> lock(g_sourcesMutex);
-        for (auto& s : g_sources) {
-            if (s->id == id) source = s;
-        }
-    }
+    std::shared_ptr<Source> source = FindSource(id);
     if (!source) return false;
     out.resize(static_cast<size_t>(frames) * kChannels);
     source->ring.Read(start, frames, out.data());
     return true;
 }
 
-std::vector<Clip> Grab(int64_t start, int64_t frames, bool dropSilent) {
+bool ReadTape(uint64_t id, const Timeline& timeline, int64_t tape, int64_t frames, std::vector<float>& out) {
+    std::shared_ptr<Source> source = FindSource(id);
+    if (!source) return false;
+    ReadTapeFrom(*source, timeline, tape, frames, out);
+    return true;
+}
+
+std::vector<Clip> Grab(const Timeline& timeline, int64_t tape, int64_t frames, bool dropSilent) {
     std::vector<Clip> clips;
+    const std::vector<Piece> pieces = timeline.Pieces(tape, frames);
+    if (pieces.empty()) return clips;
     for (auto& s : SortedSources()) {
-        if (dropSilent && s->ring.LastSoundFrame() <= start) continue;
+        if (dropSilent && s->ring.LastSoundFrame() <= pieces.front().real) continue;
         Clip clip;
         clip.id = s->id;
         clip.name = s->name;
-        clip.pcm.resize(static_cast<size_t>(frames) * kChannels);
-        s->ring.Read(start, frames, clip.pcm.data());
+        ReadTapeFrom(*s, timeline, tape, frames, clip.pcm);
         if (dropSilent && PeakOf(clip.pcm.data(), clip.pcm.size()) <= kSilentPeak) continue;
         clips.push_back(std::move(clip));
     }

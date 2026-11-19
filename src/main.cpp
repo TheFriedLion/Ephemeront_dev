@@ -14,6 +14,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
@@ -32,7 +33,7 @@ HINSTANCE g_instance = nullptr;
 HWND g_hwnd = nullptr;
 HICON g_icon = nullptr;
 UINT g_taskbarCreated = 0;
-bool g_balloonOpensFolder = false;
+std::function<void()> g_balloonAction;  // what clicking the latest notification does
 
 Capture::Config ConfigFromSettings() {
     Capture::Config c;
@@ -67,14 +68,44 @@ void RemoveTrayIcon() {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-void Balloon(const wchar_t* title, const std::wstring& text, bool opensFolder = false) {
+// A Windows notification from the tray icon. It follows the user's Windows
+// notification settings, Do Not Disturb included.
+void Notify(const wchar_t* title, const std::wstring& text, std::function<void()> onClick = nullptr) {
     NOTIFYICONDATAW nid = TrayData();
     nid.uFlags = NIF_INFO;
     wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
     wcsncpy_s(nid.szInfo, text.c_str(), _TRUNCATE);
     nid.dwInfoFlags = NIIF_NONE | NIIF_NOSOUND;
-    g_balloonOpensFolder = opensFolder;
+    g_balloonAction = std::move(onClick);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+void OpenClipsFolder() {
+    AllowSetForegroundWindow(ASFW_ANY);
+    SHCreateDirectoryExW(nullptr, g_settings.outputDir.c_str(), nullptr);
+    ShellExecuteW(nullptr, L"open", g_settings.outputDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Opens the folder holding these files (all in one folder) with them selected.
+void ShowInFolder(const std::vector<std::wstring>& files) {
+    AllowSetForegroundWindow(ASFW_ANY);  // let Explorer come to the front
+    const std::wstring dir = files.front().substr(0, files.front().find_last_of(L'\\'));
+    PIDLIST_ABSOLUTE folder = ILCreateFromPathW(dir.c_str());
+    std::vector<PIDLIST_ABSOLUTE> items;
+    std::vector<PCUITEMID_CHILD> children;
+    for (const std::wstring& f : files) {
+        if (PIDLIST_ABSOLUTE item = ILCreateFromPathW(f.c_str())) {
+            items.push_back(item);
+            children.push_back(ILFindLastID(item));
+        }
+    }
+    HRESULT hr = E_FAIL;
+    if (folder && !children.empty()) {
+        hr = SHOpenFolderAndSelectItems(folder, static_cast<UINT>(children.size()), children.data(), 0);
+    }
+    for (PIDLIST_ABSOLUTE item : items) ILFree(item);
+    if (folder) ILFree(folder);
+    if (FAILED(hr)) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void UpdateTooltip() {
@@ -105,16 +136,22 @@ void RegisterHotkeys() {
     reg(HK_PICKER, g_settings.picker);
     if (!taken.empty()) {
         Log(L"Hotkey unavailable: %s", taken.c_str());
-        Balloon(L"Hotkey unavailable", taken + L" is already used by another app. Pick a different one in Settings.");
+        Notify(L"Hotkey unavailable",
+               taken + L" is already used by another app. Click here to pick a different one.",
+               [] { SettingsUiOpen(g_instance); });
     }
 }
 
+// Saves the most recent recorded seconds. Long silences were never recorded, so
+// this reaches back past them to the last thing that was actually heard.
 void QuickSave() {
-    const int64_t frames = static_cast<int64_t>(std::min(g_settings.quickSaveSeconds, g_settings.bufferSeconds)) * SampleRate();
-    const int64_t end = NowFrame() - TailFrames();
-    std::vector<Clip> clips = Capture::Grab(end - frames, frames, g_settings.skipSilent);
+    const Capture::Timeline timeline = Capture::GetTimeline();
+    const int64_t want = static_cast<int64_t>(std::min(g_settings.quickSaveSeconds, g_settings.bufferSeconds)) * SampleRate();
+    const int64_t frames = std::min(want, timeline.Frames());
+    std::vector<Clip> clips;
+    if (frames > 0) clips = Capture::Grab(timeline, timeline.TapeEnd() - frames, frames, g_settings.skipSilent);
     if (clips.empty()) {
-        if (g_settings.notify) Balloon(L"Nothing to save", L"Ephemeront hasn't heard anything in that time.");
+        if (g_settings.notify) Notify(L"Nothing to save", L"Ephemeront hasn't heard anything yet.");
         return;
     }
     std::vector<const Clip*> chosen;
@@ -128,13 +165,8 @@ void OpenPicker() {
         return;
     }
     if (!PickerOpen(g_instance, static_cast<int64_t>(g_settings.quickSaveSeconds) * SampleRate())) {
-        Balloon(L"Nothing to clip", L"Ephemeront hasn't heard anything yet.");
+        Notify(L"Nothing to clip", L"Ephemeront hasn't heard anything yet.");
     }
-}
-
-void OpenClipsFolder() {
-    SHCreateDirectoryExW(nullptr, g_settings.outputDir.c_str(), nullptr);
-    ShellExecuteW(nullptr, L"open", g_settings.outputDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void RunCommand(WPARAM cmd) {
@@ -196,7 +228,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case NIN_SELECT:
                 case NIN_KEYSELECT: OpenPicker(); break;
                 case NIN_BALLOONUSERCLICK:
-                    if (g_balloonOpensFolder) OpenClipsFolder();
+                    if (g_balloonAction) g_balloonAction();
                     break;
             }
             return 0;
@@ -231,12 +263,13 @@ WPARAM ParseCommand() {
 
 // ---- Functions shared with the other windows --------------------------------
 
-int SaveClips(const std::vector<const Clip*>& clips, int64_t start, int64_t frames, bool skipSilent) {
+std::vector<std::wstring> SaveClips(const std::vector<const Clip*>& clips, int64_t start, int64_t frames,
+                                   bool skipSilent) {
     const std::wstring& dir = g_settings.outputDir;
     SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
     const std::wstring stamp = TimestampForFile();
     std::map<std::wstring, int> used;
-    int saved = 0;
+    std::vector<std::wstring> saved;
     for (const Clip* clip : clips) {
         if (start < 0 || start + frames > clip->Frames()) continue;
         const float* pcm = clip->pcm.data() + start * kChannels;
@@ -250,21 +283,24 @@ int SaveClips(const std::vector<const Clip*>& clips, int64_t start, int64_t fram
         for (int k = 2; GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; ++k) {
             path = base + L" (" + std::to_wstring(k) + L").wav";
         }
-        if (WriteWav(path, pcm, static_cast<size_t>(frames))) ++saved;
+        if (WriteWav(path, pcm, static_cast<size_t>(frames))) saved.push_back(path);
     }
-    Log(L"Saved %d file(s), %.1f s each, to %s", saved, frames / double(SampleRate()), dir.c_str());
+    Log(L"Saved %d file(s), %.1f s each, to %s", static_cast<int>(saved.size()), frames / double(SampleRate()),
+        dir.c_str());
     return saved;
 }
 
-void AppNotifySaved(int files, double seconds) {
+void AppNotifySaved(const std::vector<std::wstring>& files, double seconds) {
     if (!g_settings.notify) return;
-    if (files == 0) {
-        Balloon(L"Nothing saved", L"The chosen tracks were silent over that stretch.");
+    if (files.empty()) {
+        Notify(L"Nothing saved", L"The chosen tracks were silent over that stretch.");
         return;
     }
-    wchar_t text[128];
-    swprintf_s(text, L"%d track%s, %.1f s. Click to open the folder.", files, files == 1 ? L"" : L"s", seconds);
-    Balloon(L"Clip saved", text, true);
+    const int n = static_cast<int>(files.size());
+    wchar_t text[160];
+    swprintf_s(text, L"%d track%s, %.1f s. Click to show %s in the folder.", n, n == 1 ? L"" : L"s", seconds,
+               n == 1 ? L"it" : L"them");
+    Notify(L"Clip saved", text, [files] { ShowInFolder(files); });
 }
 
 int ChosenSampleRate() { return g_settings.fixed48k ? 48000 : Capture::DeviceMixRate(); }
@@ -337,7 +373,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     SetTimer(g_hwnd, kTooltipTimer, 3000, nullptr);
 
     if (firstRun) {
-        Balloon(L"Ephemeront is listening",
+        Notify(L"Ephemeront is listening",
                 HotkeyToString(g_settings.quickSave) + L" saves the last " + std::to_wstring(g_settings.quickSaveSeconds) +
                     L" s. " + HotkeyToString(g_settings.picker) + L" opens the Clip Picker.");
     }

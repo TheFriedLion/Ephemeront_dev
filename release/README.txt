@@ -1,11 +1,12 @@
-EPHEMERONT - Devbuild 1.01
+EPHEMERONT - Devbuild 1.1
 Instant replay for your ears.
 ==========================================================================
 
 Ephemeront sits quietly in your system tray and keeps a rolling recording
-of the last couple of minutes of your computer's audio. When something
-good happens (a funny line in voice chat, a sound worth sampling), press a
-hotkey and it's saved. Every app is recorded as its own track, so you can
+of the last couple of minutes of your computer's audio. Silence isn't
+recorded, so those minutes are always actual sound, even if it happened an
+hour ago. When something good happens (a funny line in voice chat, a sound
+worth sampling), press a hotkey and it's saved. Every app is recorded as its own track, so you can
 keep your friend's voice from Discord without the game noise underneath.
 
 
@@ -29,7 +30,8 @@ That's it. Ephemeront is now listening.
 SAVING CLIPS
 --------------------------------------------------------------------------
 Quick Save  (Ctrl+Alt+S)
-    Instantly saves the last 30 seconds. No window, no interruption.
+    Instantly saves the last 30 seconds of sound. No window, no
+    interruption.
 
 Clip Picker  (Ctrl+Alt+C, or left-click the tray icon)
     Opens a window showing a live waveform for each track, so you can
@@ -37,6 +39,11 @@ Clip Picker  (Ctrl+Alt+C, or left-click the tray icon)
 
     Drag on the timeline ......... select a stretch of audio
     Drag the gold edges .......... fine-tune the selection
+    Mouse wheel .................. zoom in and out
+    Hold middle button + drag .... move along the timeline
+    Scrollbar on top ............. jump around the whole recording
+    Live button (or L) ........... freeze the view (still recording)
+    End or the Now button ........ jump back to the newest audio
     Click a track's name ......... include or leave out that track
     5s / 10s / 30s / 60s / All ... quick selections (or keys 1 to 5)
     A ............................ tick or untick all tracks
@@ -47,7 +54,9 @@ Clip Picker  (Ctrl+Alt+C, or left-click the tray icon)
 Clips are saved to your Music\Ephemeront folder, one WAV file per track,
 named by date, time and app, for example:
     2026-11-11 21-45-03 Discord.wav
-Click the "Clip saved" notification to open the folder.
+Click the "Clip saved" notification to open the folder with the new
+files selected. (If Windows' Do Not Disturb is on, the notification waits
+in the notification center instead of popping up.)
 
 
 TRACKS
@@ -63,7 +72,8 @@ files.
 SETTINGS  (right-click the tray icon > Settings)
 --------------------------------------------------------------------------
 - Hotkeys: click a hotkey box and press the combination you want.
-- Quick Save length and buffer length (the longest clip you can save).
+- Quick Save length and buffer length (the longest clip you can save,
+  counting sound only).
 - Sample rate: matches your speakers or headphones by default. Choose
   48000 Hz if your clips are going into a video editor.
 - Microphone input: if your mic only shows up on the left side (common
@@ -83,6 +93,9 @@ GOOD TO KNOW
   their own track.
 - Ephemeront only keeps audio in memory. Nothing is written to disk
   until you save a clip.
+- When everything has been quiet for 4 seconds, recording pauses until
+  the next sound. In the Clip Picker, a dashed line marks each cut.
+  Constant quiet noise (like an audible mic hiss) counts as sound.
 - Memory use grows with buffer length: about 23 MB per minute of buffer
   for each track that's making sound.
 

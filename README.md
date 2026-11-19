@@ -5,10 +5,11 @@ Instant replay for your ears. Ephemeront sits in the Windows system tray, keeps 
 ## Features
 
 - **Quick Save** (`Ctrl+Alt+S`): saves the last 30 seconds instantly. No window, no interruption.
-- **Clip Picker** (`Ctrl+Alt+C`): a small window showing a waveform for each track. Drag to choose the exact moment, untick the tracks you don't want, preview with Space, save with Enter.
+- **Clip Picker** (`Ctrl+Alt+C`): a small window showing a waveform for each track. Zoom and scroll to find the moment, drag to select it, untick the tracks you don't want, preview with Space, save with Enter.
+- **Silence isn't recorded**: after 4 seconds of quiet on every track, recording pauses and the gap is spliced out, so the buffer holds the last two minutes of actual sound, however long ago it happened.
 - **One track per app**: Discord, your browser, Spotify, a game, and so on are each saved to their own WAV file. A full system mix track and your microphone are also available.
-- **Live view**: the Clip Picker's waveforms update in real time while it's open.
-- **Lightweight**: a single ~310 KB executable with no installer or runtime. Silent tracks use no buffer memory.
+- **Live view**: the Clip Picker's waveforms scroll in real time while it's open (or freeze them with the Live button).
+- **Lightweight**: a single ~400 KB executable with no installer or runtime. Silent tracks use no buffer memory.
 - Hotkeys, lengths, save folder, and tracks are all configurable from the tray icon's **Settings**.
 
 Clips are saved as 32-bit float stereo WAV files at your output device's sample rate (exactly what Windows plays, with no conversion; Settings can switch to 48 kHz for film and video work) to `Music\Ephemeront` by default, named like `2026-10-10 21-45-03 Discord.wav`.
@@ -26,13 +27,18 @@ Run `Ephemeront.exe`. A gold level-meter icon appears in the tray (it may be ins
 | Quick Save | Hotkey, or tray menu |
 | Clip Picker | Hotkey, left-click the tray icon, or tray menu |
 | Settings | Right-click the tray icon |
-| Open clips folder | Tray menu, or click the "Clip saved" notification |
+| Open clips folder | Tray menu, or click the "Clip saved" notification (shows the new files) |
 
 Inside the Clip Picker:
 
 | Key | Action |
 | --- | --- |
 | Drag on the timeline | Select a range (drag the gold edges to adjust) |
+| Mouse wheel, `+` / `-` | Zoom around the cursor |
+| Middle-drag, Shift+wheel, arrows | Move along the timeline |
+| Scrollbar | Drag or click to jump; shows the selection and cuts |
+| Home / End | Oldest audio / back to now |
+| `L` | Freeze or resume the live view (recording continues) |
 | Click a track name | Include or exclude that track |
 | `1` to `5` | Last 5 s, 10 s, 30 s, 60 s, or everything |
 | `A` | Toggle all tracks |
@@ -55,6 +61,7 @@ Ephemeront.exe --exit       Quit
 - Voice chat apps mix every speaker into one stream, so Discord is one track, not one per person.
 - All tabs of a browser share one track.
 - The System track is the full mix, so it also contains every app that has its own track.
+- Constant quiet noise (an audible mic hiss, idle menu music) counts as sound, so it keeps recording going.
 
 ## Building
 
@@ -64,4 +71,4 @@ Requires the Visual Studio 2019 (or newer) C++ build tools and a Windows 10 SDK.
 build.bat
 ```
 
-The result is `build\Ephemeront.exe`. `tools\glitch_check.py` makes a test tone and checks saved clips for dropouts and clicks. Settings live in `%APPDATA%\Ephemeront\settings.ini`, alongside a `log.txt` that's useful when troubleshooting capture.
+The result is `build\Ephemeront.exe`. `tools\glitch_check.py` makes a test tone and checks saved clips for dropouts and clicks, and `tools\compare_audio.py` checks a recording against the original sample by sample. `tools\make_icon.py` regenerates `src\ephemeront.ico` from the tray icon's design. Settings live in `%APPDATA%\Ephemeront\settings.ini`, alongside a `log.txt` that's useful when troubleshooting capture.

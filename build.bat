@@ -20,5 +20,6 @@ if not exist build mkdir build
 set CFLAGS=/nologo /utf-8 /std:c++17 /O2 /MT /EHsc /W4 /permissive- /DUNICODE /D_UNICODE /DNOMINMAX ^
  /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000A
 
-cl %CFLAGS% /Fo"build\\" /Fe"build\Ephemeront.exe" src\*.cpp /link /SUBSYSTEM:WINDOWS user32.lib || exit /b 1
+rc /nologo /fo build\ephemeront.res src\ephemeront.rc || exit /b 1
+cl %CFLAGS% /Fo"build\\" /Fe"build\Ephemeront.exe" src\*.cpp build\ephemeront.res /link /SUBSYSTEM:WINDOWS user32.lib || exit /b 1
 echo Built build\Ephemeront.exe

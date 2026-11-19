@@ -4,8 +4,10 @@
 #include "common.h"
 
 // Writes [start, start + frames) of each clip to the clips folder as WAV.
-// Returns how many files were written.
-int SaveClips(const std::vector<const Clip*>& clips, int64_t start, int64_t frames, bool skipSilent);
+// Returns the paths of the files written.
+std::vector<std::wstring> SaveClips(const std::vector<const Clip*>& clips, int64_t start, int64_t frames,
+                                   bool skipSilent);
 
-void AppNotifySaved(int files, double seconds);
+// Shows "Clip saved" (if notifications are on); clicking it shows the files.
+void AppNotifySaved(const std::vector<std::wstring>& files, double seconds);
 void AppSettingsChanged();

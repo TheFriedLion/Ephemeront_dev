@@ -25,16 +25,14 @@ bool IsSilent(const float* pcm, size_t samples) {
 
 }  // namespace
 
-RingBuffer::RingBuffer(int seconds)
-    : chunkFrames_(SampleRate()),
-      chunkBytes_(static_cast<size_t>(SampleRate()) * kBytesPerFrame),
-      chunks_(static_cast<size_t>(seconds) + 2) {}
+RingBuffer::RingBuffer()
+    : chunkFrames_(SampleRate()), chunkBytes_(static_cast<size_t>(SampleRate()) * kBytesPerFrame) {}
 
 RingBuffer::~RingBuffer() {
-    for (Chunk& c : chunks_) free(c.data);
+    for (auto& [index, data] : chunks_) free(data);
 }
 
-int64_t RingBuffer::Write(int64_t frame, const float* pcm, uint32_t frames, bool lost) {
+RingBuffer::WriteResult RingBuffer::Write(int64_t frame, const float* pcm, uint32_t frames, bool lost) {
     AcquireSRWLockExclusive(&lock_);
 
     int64_t jump = 0;
@@ -52,7 +50,6 @@ int64_t RingBuffer::Write(int64_t frame, const float* pcm, uint32_t frames, bool
         }
     }
 
-    const int64_t slots = static_cast<int64_t>(chunks_.size());
     int64_t f = frame;
     uint32_t done = 0;
     while (done < frames) {
@@ -62,29 +59,25 @@ int64_t RingBuffer::Write(int64_t frame, const float* pcm, uint32_t frames, bool
             done += skip;
             continue;
         }
-        int64_t index = f / chunkFrames_;
-        int64_t offset = f % chunkFrames_;
-        uint32_t n = static_cast<uint32_t>(std::min<int64_t>(frames - done, chunkFrames_ - offset));
+        const int64_t index = f / chunkFrames_;
+        const int64_t offset = f % chunkFrames_;
+        const uint32_t n = static_cast<uint32_t>(std::min<int64_t>(frames - done, chunkFrames_ - offset));
         const float* src = pcm ? pcm + static_cast<size_t>(done) * kChannels : nullptr;
-        bool loud = src && !IsSilent(src, static_cast<size_t>(n) * kChannels);
+        const bool loud = src && !IsSilent(src, static_cast<size_t>(n) * kChannels);
 
-        Chunk& c = chunks_[static_cast<size_t>(index % slots)];
+        auto it = chunks_.find(index);
         if (loud) {
-            if (c.index != index) {
-                if (!c.data) c.data = static_cast<float*>(malloc(chunkBytes_));
-                if (c.data) memset(c.data, 0, chunkBytes_);
-                c.index = c.data ? index : -1;
+            if (it == chunks_.end()) {
+                float* data = static_cast<float*>(calloc(1, chunkBytes_));
+                if (data) it = chunks_.emplace(index, data).first;
             }
-            if (c.data) memcpy(c.data + offset * kChannels, src, static_cast<size_t>(n) * kBytesPerFrame);
+            if (it != chunks_.end()) {
+                memcpy(it->second + offset * kChannels, src, static_cast<size_t>(n) * kBytesPerFrame);
+            }
             lastSound_ = f + n;
-        } else if (c.index == index && c.data) {
+        } else if (it != chunks_.end()) {
             // Only matters when rewriting a span that already held sound.
-            memset(c.data + offset * kChannels, 0, static_cast<size_t>(n) * kBytesPerFrame);
-        }
-
-        if (index != lastChunk_) {
-            lastChunk_ = index;
-            FreeStale(index);
+            memset(it->second + offset * kChannels, 0, static_cast<size_t>(n) * kBytesPerFrame);
         }
         f += n;
         done += n;
@@ -92,24 +85,12 @@ int64_t RingBuffer::Write(int64_t frame, const float* pcm, uint32_t frames, bool
     writePos_ = frame + frames;
 
     ReleaseSRWLockExclusive(&lock_);
-    return jump;
-}
-
-void RingBuffer::FreeStale(int64_t currentChunk) {
-    const int64_t oldest = currentChunk - static_cast<int64_t>(chunks_.size()) + 1;
-    for (Chunk& c : chunks_) {
-        if (c.data && c.index < oldest) {
-            free(c.data);
-            c.data = nullptr;
-            c.index = -1;
-        }
-    }
+    return {frame, jump};
 }
 
 void RingBuffer::Read(int64_t start, int64_t frames, float* out) const {
     AcquireSRWLockShared(&lock_);
 
-    const int64_t slots = static_cast<int64_t>(chunks_.size());
     int64_t f = start;
     int64_t done = 0;
     while (done < frames) {
@@ -121,12 +102,12 @@ void RingBuffer::Read(int64_t start, int64_t frames, float* out) const {
             done += n;
             continue;
         }
-        int64_t index = f / chunkFrames_;
-        int64_t offset = f % chunkFrames_;
-        int64_t n = std::min(frames - done, chunkFrames_ - offset);
-        const Chunk& c = chunks_[static_cast<size_t>(index % slots)];
-        if (c.index == index && c.data) {
-            memcpy(dst, c.data + offset * kChannels, static_cast<size_t>(n) * kBytesPerFrame);
+        const int64_t index = f / chunkFrames_;
+        const int64_t offset = f % chunkFrames_;
+        const int64_t n = std::min(frames - done, chunkFrames_ - offset);
+        auto it = chunks_.find(index);
+        if (it != chunks_.end()) {
+            memcpy(dst, it->second + offset * kChannels, static_cast<size_t>(n) * kBytesPerFrame);
         } else {
             memset(dst, 0, static_cast<size_t>(n) * kBytesPerFrame);
         }
@@ -135,6 +116,24 @@ void RingBuffer::Read(int64_t start, int64_t frames, float* out) const {
     }
 
     ReleaseSRWLockShared(&lock_);
+}
+
+void RingBuffer::Prune(const std::vector<std::pair<int64_t, int64_t>>& keep, int64_t before) {
+    AcquireSRWLockExclusive(&lock_);
+    size_t k = 0;
+    for (auto it = chunks_.begin(); it != chunks_.end();) {
+        const int64_t start = it->first * chunkFrames_, end = start + chunkFrames_;
+        if (end > before) break;  // chunks are in order, so the rest are newer still
+        while (k < keep.size() && keep[k].second <= start) ++k;
+        const bool kept = k < keep.size() && keep[k].first < end;
+        if (kept) {
+            ++it;
+        } else {
+            free(it->second);
+            it = chunks_.erase(it);
+        }
+    }
+    ReleaseSRWLockExclusive(&lock_);
 }
 
 int64_t RingBuffer::LastSoundFrame() const {
@@ -146,10 +145,7 @@ int64_t RingBuffer::LastSoundFrame() const {
 
 size_t RingBuffer::BytesInUse() const {
     AcquireSRWLockShared(&lock_);
-    size_t bytes = 0;
-    for (const Chunk& c : chunks_) {
-        if (c.data) bytes += chunkBytes_;
-    }
+    size_t bytes = chunks_.size() * chunkBytes_;
     ReleaseSRWLockShared(&lock_);
     return bytes;
 }
